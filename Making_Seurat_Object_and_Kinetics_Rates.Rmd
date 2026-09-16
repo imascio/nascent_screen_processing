@@ -1,0 +1,1242 @@
+---
+title: "NovaSeq"
+author: "Isabella Mascio"
+date: "2025-08-13"
+output: html_document
+---
+# load libraries and data
+```{r}
+# List of package names you want to install
+packages_to_install <- c("Seurat", "SeuratObject", "tidyverse", "PASTA", "Matrix", "genio", "BPCells", "RNAFingerprinting", "irlba", "glmGamPoi", "data.table") 
+
+# Check and install packages if not already installed
+# for (package_name in packages_to_install) {
+#   if (!require(package_name, character.only = TRUE)) {
+#     install.packages(package_name)
+#   }
+# }
+
+# Load the packages
+for (package_name in packages_to_install) {
+  library(package_name, character.only = TRUE)
+}
+rm(package_name, packages_to_install)
+
+setwd("/brahms/mascioi/RBP_screen/nascent_experiment/novaseq/")
+
+
+options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
+
+# source functions
+source("/brahms/mascioi/common_analysis_functions.R")
+
+```
+
+# ####MAKE SEURAT OBJECT####
+```{r}
+## read in arguments following terminal command
+# order of arguments 1)gex_sampleID.txt 2)input_dir_counts_matrix 3)output_dir 4)output_name.rds 5)gdo_processing_dir 6)script_folder 7)gdo_sampleID.txt 8) gex to gdo match table
+args <- c("gex_sampleID.txt","gex_processing/count","gex_processing/seurat","make_seurat_object.rds","gdo_processing","/brahms/mascioi/perturbsci-pipeline-novaseq/script_folder","gdo_sampleID.txt","/brahms/mascioi/RBP_screen/nascent_experiment/novaseq/full.gex.gdo.colnames.matching.for.making.seurat.object.csv")
+
+############################GEX PROCESSING####################################################
+
+# assigned guides with Entropy function
+EntropyAssignment <- function(object, assay = "GDO", entropy.metadata.name = "entropy", denoise.cutoff = 5, add.num = 1e-8, label.cutoff = 1, label.name = "entropy.label", guide.name = "entropy.guide", target.name = "entropy.gene", guide.notation = "g[0-9]+$") {
+  # get guide counts and denoise data
+  gdo.counts <- GetAssayData(object, assay = assay, layer = "counts")
+  gdo.counts <- as.matrix(gdo.counts)
+  gdo.counts[gdo.counts < denoise.cutoff] <- 0 #de noise data
+  
+  # calculate entropy for each cell
+  cell_entropy <- sapply(1:ncol(gdo.counts), function(i) {
+    x <- gdo.counts[,i]
+    x <- x + add.num
+    x <- x / sum(x)
+    -sum(x * log2(x))
+  })
+  
+  # add entropy values to metadata
+  names(cell_entropy) <- colnames(gdo.counts)
+  object <- AddMetaData(object, cell_entropy, col.name = entropy.metadata.name)
+  
+  # label cells as assigned or unassigned based on entropy
+  assignment <- ifelse(round(cell_entropy,2) > label.cutoff, "Unassigned", "Assigned")
+  names(assignment) <- names(cell_entropy)
+  object <- AddMetaData(object, assignment, label.name)
+  
+  # assign guides
+  object[[]][,guide.name] <- object[[]][,label.name]
+  assigned_cells <- rownames(object[[]])[which(object[[]][,label.name] == "Assigned")]
+  
+  top_guide <- sapply(assigned_cells, function(cell) {
+    cell.counts <- as.vector(gdo.counts[, cell])
+    rownames(gdo.counts)[which.max(cell.counts)]
+  })
+  
+  object[[]][assigned_cells, guide.name] <- top_guide
+  
+  # assign target gene
+  object[[]][, target.name] <- gsub(guide.notation,"",object[[]][, guide.name])
+  return(object)
+}
+
+### make gex matrix list and rename col names
+n_pcr_samples <- count_lines(args[1])
+sample_names <- read.table(args[1])
+gdo_names <-read.table(args[7])
+
+# create dir for BP cells counts matrixes
+dir.create("gex_processing/count_BP")
+dir.create("gex_processing/metadata")
+dir.create("gdo_processing/count_BP")
+dir.create("seurat_objects")
+dir.create("seurat_objects/12_libraries")
+## load barcode table
+all.bc <- read.csv("/brahms/mascioi/rt_lig_ligrc_sgrnacapt_barcodes.csv")
+
+# convert CSV files to BP cells on disk dirs
+for (i in 1:n_pcr_samples) {
+  # read in counts
+  name <- sample_names$V1[i]
+  print(paste0("Processing: ",name))
+  c <- fread(file = 
+               paste0(args[2],"/",name, "_counts.tsv.gz"),)
+  # save rownames
+  r.names <- c$gene
+  # convert df to matrix then sparse matrix
+  c <- Matrix(as.matrix(c[,2:ncol(c)], nrow = nrow(c)), sparse = T)
+  # add rownames to sparse matrix
+  rownames(c) <- r.names
+  # save to on disk BP cells dir
+  write_matrix_dir(mat = c, dir = paste0("gex_processing/count_BP/",name))
+  # remove to save space
+  rm(c)
+}
+
+################################################################################
+## load guide matrix for future processing
+# save location of report folder
+report_folder = paste0(args[5],"/gRNA_report")
+
+# format the output into a sparse matrix ready for R analysis
+result = sciRNAseq_gene_count_summary(report_folder)
+gRNA_df_cell = result[[1]]
+gRNA_df_gene = result[[2]]
+gRNA_mat = result[[3]]
+# saving guide data as RData
+save(gRNA_df_cell, gRNA_df_gene, gRNA_mat, file = paste0(args[5], "/gRNA_Summary.RData"))
+load(file = paste0(args[5], "/gRNA_Summary.RData"))
+ncol(gRNA_mat)
+colnames_gdo <- colnames(gRNA_mat)
+# making a table of the combinations of barcodes in order of colnames
+gdo_bc_combinations <- data.frame(inneri7 = gsub("\\..*","",colnames_gdo),
+                                  sgRNAcapture = substr(gsub(".*\\.","",colnames_gdo) , start = 11 , stop = 20),
+                                  lig = substr(gsub(".*\\.","",colnames_gdo) , start = 1 , stop = 10))
+
+# making inner i7 list - need both gex and gdo sample info to correctly combine the pcr rna barcodes
+i7list <- read.csv(args[8])
+gdo_bc_i7ID <- left_join(x = gdo_bc_combinations, y = i7list, by = join_by(inneri7))
+new_gd_colnames <- paste0(gdo_bc_i7ID$GEX, "_" ,gdo_bc_i7ID$lig,gdo_bc_i7ID$sgRNAcapture)
+colnames(gRNA_mat) <- new_gd_colnames
+
+
+# save processed guide matrix
+saveRDS(gRNA_mat, paste0(args[5],"/gdo_procesed_matrix.rds"))
+
+## merge/convert 
+# merge RT counts
+# make RT metadata
+guides <- colnames(gRNA_mat)
+rtlig.barcodes <- str_split_fixed(guides, "_", n=2)[,2]
+guide.metadata <- data.frame(guides = guides,
+                      pcr = str_split_fixed(guides, "_", n=2)[,1],
+                      ligation.barcodes = substr(rtlig.barcodes, start = 1, stop = 10),
+                      rt.barcodes = substr(rtlig.barcodes, start = 11 , stop = 20))
+
+
+write_matrix_dir(mat = gRNA_mat, dir = "gdo_processing/gdo_processed")
+gRNA_mat <- readRDS(paste0(args[5],"/gdo_procesed_matrix.rds"))
+
+rm(result, gRNA_df_cell, gRNA_df_gene, colnames_gdo, gdo_bc_combinations, i7list, gdo_bc_i7ID, new_gd_colnames, guides, guide.metadata, randHex_gmeta, merged.guides, new.randHex.colnames, shortdT.gmat, randHex.gmat, full.randHex.gmat, full.shortdT.gmat, empty.randHex, empty.shortdT, match_randN1, match_randN2, missing.shortdT.guides, missing.randHex.guides, randHex_guides, shortdT_guides, shortdT_idx, randHex_idx, rtlig.barcodes)
+##################################################################
+# make 12 seurat objects
+# get all 12 names
+libraries <- unique(str_split_fixed(sample_names$V1,"[A-H]",n=2))
+# list all dirs
+BP_dirs <- list.dirs("gex_processing/count_BP", full.names = F)
+
+
+# get all gene names
+genes.in.96.mats <- c()
+
+for (n in 2:length(BP_dirs)) {
+  bpmat <- open_matrix_dir(dir = paste0("gex_processing/count_BP/",BP_dirs[n]))
+  genes.in.96.mats <- c(genes.in.96.mats, rownames(bpmat))
+  rm(bpmat)
+}
+genes.in.96.mats <- unique(sort(genes.in.96.mats))
+saveRDS(genes.in.96.mats, "list.of.all.genes.in.96.matrices.RDS")
+############# FOR LOOP EVENTUALLY
+for (i in 1:nrow(libraries)) {
+# get 8 PCR BC matrices for this one lib - make sure all genes are present
+single.lib.names <- grep(paste0(libraries[i,1],"[A-H]",libraries[i,2]),BP_dirs, value = T)
+data.list <- list()
+# Load in BP matrices
+  for (j in 1:length(single.lib.names)) {
+    # load BPcells matrices - add lib PCR bc to cell name
+    m <- open_matrix_dir(dir = paste0("gex_processing/count_BP/",single.lib.names[j]))
+    colnames(m) <- paste0(single.lib.names[j],"_",colnames(m))
+    # convert to sparse matrix and add genes missing
+    m <- Matrix(as.matrix(m),sparse = T)
+    missing.genes <- genes.in.96.mats[!(genes.in.96.mats %in% rownames(m))] 
+    new.rows <- Matrix(data = 0, nrow = length(missing.genes), ncol = ncol(m), sparse = T)
+    rownames(new.rows) <- c(missing.genes)
+    colnames(new.rows) <- colnames(m)
+    new.m <- rbind(m,new.rows)
+    new.m <- new.m[genes.in.96.mats,]
+    
+    data.list[[j]] <- new.m
+    names(data.list)[j] <- single.lib.names[j]
+    # write to new counts dir BP cells
+    write_matrix_dir(mat = new.m, dir = paste0("gex_processing/count_BP/",single.lib.names[j],"_added_missing_genes"))
+    rm(new.m,m,new.rows,missing.genes)
+  }
+
+  # combine libraries into 1
+  single.lib.gex <- Reduce(cbind,data.list)
+  rm(data.list)
+  write_matrix_dir(mat = single.lib.gex, dir = paste0("gex_processing/count_BP/",libraries[i,1],"col",libraries[i,2]))
+  
+  
+
+  # make object with BP counts and metadata
+  BP.gex <- open_matrix_dir(paste0("gex_processing/count_BP/",libraries[i,1],"col",libraries[i,2]))
+  obj <- CreateSeuratObject(BP.gex, min.features = 200)
+  
+  cells.in.obj <- rownames(obj[[]])
+  rtlig.barcodes <- str_split_fixed(cells.in.obj, "_", n=2)[,2]
+  
+  obj$pcr = str_split_fixed(cells.in.obj, "_", n=2)[,1]
+  obj$ligation.barcodes = substr(rtlig.barcodes, start = 1, stop = 10)
+  obj$rt.barcodes = substr(rtlig.barcodes, start = 11 , stop = 20)
+  
+  # keep genes.in.96.dirs BP_dirs libraries gRNA.mat.merged BP.gex obj
+  rm(merged.cells.metadata, cell.metadata, full.randHex.mat, full.shortdT.mat, randHex_meta, randHex.mat, shortdT.mat, single.lib.gex, single.lib.gex.merged, cells, merged.cells, missing.shortdT.cells, missing.randHex.cells, shortdT_idx, randHex_idx, empty.randHex, empty.shortdT, match_randN1, match_randN2, new.randHex.colnames, shortdT.sums, randHex.sums, total.sums, rtlig.barcodes, randHex_cells, shortdT_cells)
+  
+  
+  ### add guide counts
+
+  overlapping.cells.in.gdo <- colnames(gRNA_mat)[colnames(gRNA_mat) %in% cells.in.obj]  
+  cells.missing.guides <- cells.in.obj[!(cells.in.obj %in% overlapping.cells.in.gdo)]
+  
+  empty.grna <- Matrix(data = 0, nrow = nrow(gRNA_mat), ncol = length(cells.missing.guides), sparse = T)
+  rownames(empty.grna) <- rownames(gRNA_mat)
+  colnames(empty.grna) <- cells.missing.guides
+  
+  sub.grna.mat <- cbind(gRNA_mat[,overlapping.cells.in.gdo],empty.grna)
+  write_matrix_dir(mat = sub.grna.mat, dir = paste0("gdo_processing/count_BP/",libraries[i,1],"col",libraries[i,2]))
+  sub.grna.mat <- open_matrix_dir(paste0("gdo_processing/count_BP/",libraries[i,1],"col",libraries[i,2]))
+  
+  obj[["GDO"]] <- CreateAssay5Object(sub.grna.mat)
+  
+  
+  rm(cells.in.obj, overlapping.cells.in.gdo, cells.missing.guides, empty.grna)
+  
+  
+  ##### assign guides
+  obj <- EntropyAssignment(obj)
+  saveRDS(obj, paste0("seurat_objects/12_libraries/",libraries[i,1],"col",libraries[i,2],"_all_cells_guides_assigned.rds"))
+  rm(obj)
+  gc()
+}
+
+
+
+rm(gdo_names, gRNA.mat.merged, sample_names, BP_dirs, genes.in.96.mats, i, j, n_pcr_samples, single.lib.names, name)
+
+### load in objs, merge them, join layers, write new on disk files, and save final full object
+seurat.objs.files <- list.files("seurat_objects/12_libraries")
+seurat.list <- list()
+
+for (i in 1:length(seurat.objs.files)) {
+  name <- gsub("_.*","",seurat.objs.files[i])
+  obj <- readRDS(paste0("seurat_objects/12_libraries/",seurat.objs.files[i]))
+  seurat.list[[i]] <- obj
+  names(seurat.list)[i] <- name
+  rm(name,obj)
+}
+
+
+# combining all seurat objects together
+if (length(seurat.list) > 1) {
+  obj <- merge(seurat.list[[1]],
+                 seurat.list[2:length(seurat.list)])
+} else {
+  obj <- seurat.list[[1]]
+}
+
+rm(gdo.mat, gdo.subset, gRNA_count, gdo_bc_combinations,gdo_bc_i7ID,gdo_names,gRNA_df_cell,gRNA_df_gene,gRNA_mat, i7list, missing_cells, missing_guides,result,sample_names, args,cell.intersect,cells,colnames_gdo,i, ligation.barcodes,n_pcr_samples,new_gd_colnames,report_folder,rt.barcodes,rtlig.barcodes,name)
+
+
+
+obj <- JoinLayers(obj)
+obj[["GDO"]] <- JoinLayers(obj[["GDO"]])
+
+
+
+
+
+
+
+# # Write the counts layer to a directory
+write_matrix_dir(mat = obj[["RNA"]]$counts, dir = 'seurat_objects/full_object_RNA_counts')
+counts.mat <- open_matrix_dir(dir = "seurat_objects/full_object_RNA_counts")
+obj[["RNA"]]$counts <- counts.mat
+
+write_matrix_dir(mat = obj[["GDO"]]$counts, dir = 'seurat_objects/full_object_GDO_counts')
+guides.mat <- open_matrix_dir(dir = "seurat_objects/full_object_GDO_counts")
+obj[["GDO"]]$counts <- guides.mat
+
+
+saveRDS(obj, "seurat_objects/260817_full_object_entropy_guides.rds")
+obj <- readRDS("seurat_objects/260817_full_object_entropy_guides.rds")
+
+
+
+df <- data.frame(lib = rep(NA, length(seurat.list)),
+                 assigned = NA,
+                 unassigned = NA,
+                 total = NA)
+
+for (i in 1:length(seurat.list)) {
+  t <- table(seurat.list[[i]]$entropy.label)
+  df$lib[i] <- names(seurat.list)[i]
+  df$assigned[i] <- t[1]
+  df$unassigned[i] <- t[2]
+  df$total[i] <- sum(t)
+}
+
+df$pct.assigned <- df$assigned/df$total * 100
+
+ggplot(df, aes(x=lib,y=pct.assigned)) +
+  geom_col()
+
+ggplot(obj[[]], aes(x = pcr, y = entropy, col = entropy.label)) +
+  geom_jitter(size = 0.3) + 
+  theme_bw() +
+  labs(title = "Entropy", x = "library", y = "entropy (bits)") 
+
+
+mean(obj$entropy[obj$entropy < 5 & obj$entropy.label == "Unassigned"])
+to.plot <- names(sort(obj$entropy[obj$entropy.label == "Unassigned" & obj$entropy < 5]))
+head(sort(obj$entropy[obj$entropy.label == "Unassigned" & obj$entropy < 5]), n = 30)
+plot(obj[["GDO"]]$counts[,to.plot[1]])
+
+
+Idents(obj) <- "entropy.label"
+VlnPlot(obj, features = c("nCount_RNA", "nFeature_RNA", "nCount_GDO"), pt.size = 0, log = T)
+
+
+meta.4sU <- read.csv("../260713_4sU_RT_metadata.csv")
+all(obj$rt.barcodes %in% meta.4sU$Barcode)
+
+idx <- match(obj$rt.barcodes, meta.4sU$Barcode)
+obj$ctrl_4sU <- meta.4sU$X4sU[idx]
+table(obj$ctrl_4sU)
+table(obj$entropy.gene)
+
+
+VlnPlot(obj, features = c("nCount_RNA", "nFeature_RNA", "nCount_GDO"), group.by = "ctrl_4sU", log = T, pt.size = 0)
+
+
+obj$guide_4sU <- paste0(obj$entropy.guide, "_", obj$ctrl_4sU)
+obj$gene_4sU <- paste0(obj$entropy.gene, "_", obj$ctrl_4sU)
+table(obj$gene_4sU)
+
+saveRDS(obj, "seurat_objects/260817_full_object_entropy_guides.rds")
+obj <- readRDS("seurat_objects/260817_full_object_entropy_guides.rds")
+```
+
+# #### NASCENT ####
+
+# nascent counts! - nova ref
+## adding to seurat
+```{r}
+library(data.table)
+library(Matrix)
+library(Seurat)
+library(BPCells)
+
+nascent <- readRDS("seurat_objects/260904_guide_assigned_cells.rds")
+
+nascent.count.files <- list.files(
+  "gex_processing/nascent_count_nova_ref",
+  full.names = TRUE
+)
+
+sampleID <- basename(nascent.count.files)
+sampleID <- gsub("_nascent_counts.tsv.gz", "", sampleID)
+
+cell.keep <- Cells(nascent)
+
+triplets <- vector("list", length(nascent.count.files))
+
+for (i in seq_along(nascent.count.files)) {
+  print(paste0("Sample number ",i," of ",length(nascent.count.files)))
+  dt <- fread(nascent.count.files[i])
+  
+  # Rename non-gene columns to sample-prefixed cell names
+  count.cols <- setdiff(names(dt), "gene")
+  setnames(
+    dt,
+    old = count.cols,
+    new = paste0(sampleID[i], "_", count.cols)
+  )
+
+  # Keep only cells present in the Seurat object
+  keep.cols <- intersect(names(dt), cell.keep)
+  dt <- dt[, c("gene", keep.cols), with = FALSE]
+
+  # Convert wide counts to long sparse triplets
+  long <- melt(
+    dt,
+    id.vars = "gene",
+    variable.name = "cell",
+    value.name = "count",
+    variable.factor = FALSE
+  )
+
+  # Keep only nonzero, non-missing values
+  long <- long[!is.na(count) & count != 0]
+
+  triplets[[i]] <- long
+}
+rm(dt, long, count.cols, keep.cols)
+
+triplets <- rbindlist(triplets)
+
+genes <- unique(triplets$gene)
+cells <- cell.keep[cell.keep %in% unique(triplets$cell)]
+
+nascent.sparse <- sparseMatrix(
+  i = match(triplets$gene, genes),
+  j = match(triplets$cell, cells),
+  x = triplets$count,
+  dims = c(length(genes), length(cells)),
+  dimnames = list(genes, cells)
+)
+
+nascent[["nascentNova"]] <- CreateAssay5Object(counts = nascent.sparse)
+
+VlnPlot(
+  nascent,
+  group.by = "entropy.label",
+  features = c("nCount_RNA","nCount_nascentNova"),
+  log = TRUE,
+  pt.size = 0
+)
+
+rm(triplets)
+gc()
+
+
+saveRDS(nascent, "seurat_objects/260904_assigned_cells_w_nascent_counts_nova_ref.rds")
+
+rm(nascent, nascent.sparse, nascent.count.files, cell.keep,cells,i,sampleID)
+gc()
+
+```
+
+
+## calculating rates
+uses the differential equations from perturbsci kinetics
+
+This gives you beta (degradation rate) and alpha (synthesis rate) matrices, genes × pseudo-cell-groups, with NA for genes that failed the validity filter in that group.
+```{r}
+library(Seurat)
+library(Matrix)
+
+t <- 2  # hours of 4sU labeling
+obj <- readRDS("seurat_objects/260904_assigned_cells_w_nascent_counts_nova_ref.rds")
+
+# subset to cells identified as KD based on phenotype
+kd.4sU <- subset(obj, lmix.model != "NP")
+kd.4sU[["RNA"]]$counts <- as(kd.4sU[["RNA"]]$counts, "dgCMatrix")
+gc()
+
+
+################## nascent ########################
+# 1. Define pseudo-cell groups (e.g. by CRISPRi target gene / perturbation)
+#    Adjust "target_gene" to whatever metadata column holds your grouping
+Idents(kd.4sU) <- kd.4sU$entropy.gene
+table(kd.4sU$entropy.gene)
+table(kd.4sU$entropy.guide)
+# 2. Pseudobulk (sum) counts per group, separately for each assay
+total_counts <- AggregateExpression(kd.4sU, assays = "RNA", group.by = "entropy.gene",
+                                     slot = "counts", return.seurat = FALSE)$RNA
+
+nascent_counts <- AggregateExpression(kd.4sU, assays = "nascentNova", group.by = "entropy.gene",
+                                       slot = "counts", return.seurat = FALSE)$nascentNova
+
+# convert to base matrices immediately
+total_counts   <- as.matrix(total_counts)
+nascent_counts <- as.matrix(nascent_counts)
+
+# make sure genes are aligned
+common_genes <- intersect(rownames(total_counts), rownames(nascent_counts)) #25,217 genes
+total_counts   <- total_counts[common_genes, ]
+nascent_counts <- nascent_counts[common_genes, ]
+
+# 3. Compute ratios
+Rn_over_R <- nascent_counts / total_counts
+Rp_over_R <- 1 - Rn_over_R
+
+# 4. Mask invalid entries (Rn = 0 or Rn >= R, or R = 0)
+valid <- (nascent_counts > 0) & (Rp_over_R > 0) & (total_counts > 0)
+
+beta_4sU <- matrix(NA, nrow = nrow(total_counts), ncol = ncol(total_counts),
+               dimnames = dimnames(total_counts))
+beta_4sU[valid] <- -log(Rp_over_R[valid]) / t
+
+alpha_4sU <- beta_4sU * total_counts
+
+total_norm <- sweep(total_counts, 2, colSums(total_counts), "/") * 1e6
+alpha_4sU_norm <- beta_4sU * total_norm
+
+save(beta_4sU, alpha_4sU, alpha_4sU_norm, file = "kinetics_rates_per_perturbation_nova_ref_4sU_kd.RData")
+load("kinetics_rates_per_perturbation_nova_ref_4sU_kd.RData")
+
+
+### by guide
+Idents(kd.4sU) <- kd.4sU$entropy.guide
+table(kd.4sU$entropy.gene)
+table(kd.4sU$entropy.guide)
+# 2. Pseudobulk (sum) counts per group, separately for each assay
+total_counts_guide <- AggregateExpression(kd.4sU, assays = "RNA", group.by = "entropy.guide",
+                                     slot = "counts", return.seurat = FALSE)$RNA
+
+nascent_counts_guide <- AggregateExpression(kd.4sU, assays = "nascentNova", group.by = "entropy.guide",
+                                       slot = "counts", return.seurat = FALSE)$nascentNova
+
+# convert to base matrices immediately
+total_counts_guide   <- as.matrix(total_counts_guide)
+nascent_counts_guide <- as.matrix(nascent_counts_guide)
+
+# make sure genes are aligned
+common_genes_guide <- intersect(rownames(total_counts_guide), rownames(nascent_counts_guide)) #25,217 genes
+total_counts_guide   <- total_counts_guide[common_genes_guide, ]
+nascent_counts_guide <- nascent_counts_guide[common_genes_guide, ]
+
+# 3. Compute ratios
+Rn_over_R_guide <- nascent_counts_guide / total_counts_guide
+Rp_over_R_guide <- 1 - Rn_over_R_guide
+
+# 4. Mask invalid entries (Rn = 0 or Rn >= R, or R = 0)
+valid_guide <- (nascent_counts_guide > 0) & (Rp_over_R_guide > 0) & (total_counts_guide > 0)
+
+beta_4sU_guide <- matrix(NA, nrow = nrow(total_counts_guide), ncol = ncol(total_counts_guide),
+               dimnames = dimnames(total_counts_guide))
+beta_4sU_guide[valid_guide] <- -log(Rp_over_R_guide[valid_guide]) / t
+
+alpha_4sU_guide <- beta_4sU_guide * total_counts_guide
+
+total_norm_guide <- sweep(total_counts_guide, 2, colSums(total_counts_guide), "/") * 1e6
+alpha_4sU_norm_guide <- beta_4sU_guide * total_norm_guide
+
+save(beta_4sU_guide, alpha_4sU_guide, alpha_4sU_norm_guide, file = "kinetics_rates_per_guide_nova_ref_4sU_kd.RData")
+load("kinetics_rates_per_guide_nova_ref_4sU_kd.RData")
+```
+## checking gene counts for possible filtering of low total expression
+```{r}
+x1 <- data.frame(beta_4sU_guide)
+genes.w.same.beta <- rownames(x1)[which(x1$NTg1 > 0.33 & x1$NTg1 < 0.38 & !is.na(x1$NTg1))]
+table(x1[genes.w.same.beta,"NTg1"])
+
+## taking the by guide - nascent fingerprint kd total and nascent counts
+total_counts_guide[genes.w.same.beta,"NTg1"]
+table(total_counts_guide[genes.w.same.beta,"NTg1"])
+
+hist(total_counts_guide[genes.w.same.beta,"NTg1"])
+
+nascent_counts_guide[genes.w.same.beta,"NTg1"]
+
+table(nascent_counts_guide[genes.w.same.beta,"NTg1"]/total_counts_guide[genes.w.same.beta,"NTg1"])
+
+plot(total_counts_guide[genes.w.same.beta,"NTg1"],nascent_counts_guide[genes.w.same.beta,"NTg1"])
+```
+
+## matching betas across guides
+```{r}
+library(tidyverse)
+load("kinetics_rates_per_guide_nova_ref_4sU_kd.RData")
+load("kinetics_rates_per_guide_nova_ref_rbp_kd.RData")
+
+eps <- 1e-8
+lfc_cutoff <- 0.25
+
+guide_to_pert <- function(x) gsub("g[0-9]+$", "", x)
+
+beta_guide_4sU_lfc <- as.data.frame(beta_4sU_guide) %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "guide", values_to = "beta") %>%
+  mutate(perturbation = guide_to_pert(guide)) %>%
+  group_by(gene) %>%
+  mutate(nt_beta_mean = mean(beta[perturbation == "NT"], na.rm = TRUE),
+         log2FC_beta_vs_NT = log2((beta + eps) / (nt_beta_mean + eps))) %>%
+  ungroup()
+
+beta_4sU_concordance <- beta_guide_4sU_lfc %>%
+  filter(perturbation != "NT", is.finite(log2FC_beta_vs_NT)) %>%
+  group_by(gene, perturbation) %>%
+  summarise(
+    guides = paste(guide, collapse = ";"),
+    n_guides_valid = n(),
+    median_log2FC_beta_vs_NT = median(log2FC_beta_vs_NT),
+    n_guides_same_direction_passing =
+      sum(sign(log2FC_beta_vs_NT) == sign(median_log2FC_beta_vs_NT) &
+          abs(log2FC_beta_vs_NT) >= lfc_cutoff),
+    n_guides_opposite_direction_passing =
+      sum(sign(log2FC_beta_vs_NT) == -sign(median_log2FC_beta_vs_NT) &
+          abs(log2FC_beta_vs_NT) >= lfc_cutoff),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    reproducible = n_guides_valid >= 2 &
+      n_guides_same_direction_passing >= 2 &
+      n_guides_opposite_direction_passing == 0,
+    direction = ifelse(
+      median_log2FC_beta_vs_NT > 0,
+      "increased_beta_faster_degradation",
+      "decreased_beta_slower_degradation"
+    )
+  )
+
+beta_4sU_concordance_match <- beta_4sU_concordance %>% dplyr::filter(reproducible == TRUE)
+
+save(beta_4sU_concordance_match, beta_guide_4sU_lfc, file = "guide_betas_4sU_lfc_concordance_nova_ref.RData")
+load("guide_betas_4sU_lfc_concordance_nova_ref.RData")
+
+#### alpha_norm
+alpha_norm_guide_4sU_lfc <- as.data.frame(alpha_4sU_norm_guide) %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "guide", values_to = "alpha_norm") %>%
+  mutate(perturbation = guide_to_pert(guide)) %>%
+  group_by(gene) %>%
+  mutate(nt_alpha_norm_mean = mean(alpha_norm[perturbation == "NT"], na.rm = TRUE),
+         log2FC_alpha_norm_vs_NT = log2((alpha_norm + eps) / (nt_alpha_norm_mean + eps))) %>%
+  ungroup()
+
+alpha_norm_4sU_concordance <- alpha_norm_guide_4sU_lfc %>%
+  filter(perturbation != "NT", is.finite(log2FC_alpha_norm_vs_NT)) %>%
+  group_by(gene, perturbation) %>%
+  summarise(
+    guides = paste(guide, collapse = ";"),
+    n_guides_valid = n(),
+    median_log2FC_alpha_norm_vs_NT = median(log2FC_alpha_norm_vs_NT),
+    n_guides_same_direction_passing =
+      sum(sign(log2FC_alpha_norm_vs_NT) == sign(median_log2FC_alpha_norm_vs_NT) &
+          abs(log2FC_alpha_norm_vs_NT) >= lfc_cutoff),
+    n_guides_opposite_direction_passing =
+      sum(sign(log2FC_alpha_norm_vs_NT) == -sign(median_log2FC_alpha_norm_vs_NT) &
+          abs(log2FC_alpha_norm_vs_NT) >= lfc_cutoff),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    reproducible = n_guides_valid >= 2 &
+      n_guides_same_direction_passing >= 2 &
+      n_guides_opposite_direction_passing == 0,
+    direction = ifelse(
+      median_log2FC_alpha_norm_vs_NT > 0,
+      "increased_alpha_norm_faster_synthesis",
+      "decreased_alpha_norm_slower_synthesis"
+    )
+  )
+
+alpha_norm_4sU_concordance_match <- alpha_norm_4sU_concordance %>% dplyr::filter(reproducible == TRUE)
+
+save(alpha_norm_4sU_concordance_match, alpha_norm_guide_4sU_lfc, file = "guide_alpha_norm_4sU_lfc_concordance_nova_ref.RData")
+load("guide_alpha_norm_4sU_lfc_concordance_nova_ref.RData")
+```
+
+
+# #### filtering betas ####
+# redo but set total counts with <20 to NA for beta/alphas
+```{r}
+library(Seurat)
+library(Matrix)
+
+
+obj <- readRDS("seurat_objects/260904_assigned_cells_w_nascent_counts_nova_ref.rds")
+
+kd.4sU <- subset(obj, lmix.model != "NP")
+kd.4sU[["RNA"]]$counts <- as(kd.4sU[["RNA"]]$counts, "dgCMatrix")
+gc()
+### by guide
+Idents(kd.4sU) <- kd.4sU$entropy.guide
+table(kd.4sU$entropy.gene)
+table(kd.4sU$entropy.guide)
+# 2. Pseudobulk (sum) counts per group, separately for each assay
+total_counts_guide <- AggregateExpression(kd.4sU, assays = "RNA", group.by = "entropy.guide",
+                                     slot = "counts", return.seurat = FALSE)$RNA
+
+nascent_counts_guide <- AggregateExpression(kd.4sU, assays = "nascentNova", group.by = "entropy.guide",
+                                       slot = "counts", return.seurat = FALSE)$nascentNova
+
+# convert to base matrices immediately
+total_counts_guide   <- as.matrix(total_counts_guide)
+nascent_counts_guide <- as.matrix(nascent_counts_guide)
+colnames(total_counts_guide)
+genes.less.than.20.total.counts <- data.frame(genes = GI.genes,
+                                              METTL3g2 = NA,
+                                              METTL3g5 = NA,
+                                              YTHDF2g2 = NA,
+                                              YTHDF2g5 = NA,
+                                              RACK1g1 = NA,
+                                              RACK1g2 = NA,
+                                              NTg1 = NA,
+                                              NTg2 = NA,
+                                              NTg3 = NA
+                                              )
+rownames(genes.less.than.20.total.counts) <- genes.less.than.20.total.counts$genes
+
+for (i in 1:9) {
+  col.i <- i+1
+  guide <- colnames(genes.less.than.20.total.counts)[col.i]
+  genes.less.than.20.total.counts[GI.genes,col.i] <- unname(total_counts_guide[GI.genes,guide] < 20)
+}
+```
+### filtered correlation matrix
+```{r}
+####### filter all genes not just those in GI Index
+obj <- readRDS("seurat_objects/260904_assigned_cells_w_nascent_counts_nova_ref.rds")
+
+kd.4sU <- subset(obj, lmix.model != "NP")
+kd.4sU[["RNA"]]$counts <- as(kd.4sU[["RNA"]]$counts, "dgCMatrix")
+gc()
+### by guide
+Idents(kd.4sU) <- kd.4sU$entropy.guide
+table(kd.4sU$entropy.gene)
+table(kd.4sU$entropy.guide)
+# 2. Pseudobulk (sum) counts per group, separately for each assay
+total_counts_guide <- AggregateExpression(kd.4sU, assays = "RNA", group.by = "entropy.guide",
+                                     slot = "counts", return.seurat = FALSE)$RNA
+
+# convert to base matrices immediately
+total_counts_guide   <- as.matrix(total_counts_guide)
+
+load("kinetics_rates_per_guide_nova_ref_4sU_kd.RData")
+load("guide_betas_4sU_lfc_concordance_nova_ref.RData")
+
+colnames(total_counts_guide)
+genes.less.than.20.total.counts <- data.frame(genes = rownames(beta_4sU_guide))
+
+rownames(genes.less.than.20.total.counts) <- genes.less.than.20.total.counts$genes
+
+for (i in 1:length(colnames(total_counts_guide))) {
+  guide <- colnames(total_counts_guide)[i]
+  genes.less.than.20.total.counts[rownames(beta_4sU_guide),guide] <- unname(total_counts_guide[rownames(beta_4sU_guide),guide] < 20)
+}
+
+###### filter beta
+#######
+# set genes with less than 20 total counts per perturbation to NA for beta and beta lfc
+
+for (i in 1:length(colnames(beta_4sU_guide))) {
+  guide <- colnames(beta_4sU_guide)[i]
+  t.index <- genes.less.than.20.total.counts[,guide]
+  beta_4sU_guide[t.index,guide] <- NA
+}
+
+low_count_mat <- as.matrix(
+  genes.less.than.20.total.counts[, setdiff(colnames(genes.less.than.20.total.counts), "genes")]
+)
+
+rownames(low_count_mat) <- genes.less.than.20.total.counts$genes
+
+valid <- beta_guide_4sU_lfc$gene %in% rownames(low_count_mat) &
+  beta_guide_4sU_lfc$guide %in% colnames(low_count_mat)
+
+low_count <- rep(FALSE, nrow(beta_guide_4sU_lfc))
+
+low_count[valid] <- low_count_mat[
+  cbind(beta_guide_4sU_lfc$gene[valid], beta_guide_4sU_lfc$guide[valid])
+]
+
+beta_guide_4sU_lfc$log2FC_beta_vs_NT[low_count] <- NA
+
+
+beta_guide_filtered <- beta_4sU_guide
+beta_lfc_guide_filtered <- beta_guide_4sU_lfc
+
+beta_guide_wide_filtered <- beta_lfc_guide_filtered %>%
+  select(gene, guide, log2FC_beta_vs_NT) %>%
+  pivot_wider(
+    names_from = guide,
+    values_from = log2FC_beta_vs_NT
+  )
+beta_lfc_guide_matrix_filtered <- beta_guide_wide_filtered %>%
+  tibble::column_to_rownames("gene")
+
+
+save(beta_guide_filtered,beta_lfc_guide_filtered, beta_lfc_guide_matrix_filtered, file = "filtered_beta_guide_and_lfc_4sU_kd_for_low_counts.RData")
+
+########
+
+
+
+
+library(dplyr)
+library(tidyr)
+
+beta_guide_wide <- beta_guide_4sU_lfc %>%
+  select(gene, guide, log2FC_beta_vs_NT) %>%
+  pivot_wider(
+    names_from = guide,
+    values_from = log2FC_beta_vs_NT
+  )
+beta_guide_matrix <- beta_guide_wide %>%
+  tibble::column_to_rownames("gene")
+
+# cor.beta.lfc <- cor(beta_guide_matrix, use = "complete.obs")
+# heatmap.2(cor.beta.lfc)
+
+
+
+#### subset to top up and down
+lambdas <- readRDS("../../novaseq/260120_novaseq/fingerprints/by.gene/lambdas.matrix.rds")
+lambdas <- as.data.frame(lambdas)
+lambdas <- lambdas %>% dplyr::select(unique(beta_guide_4sU_lfc$perturbation)[unique(beta_guide_4sU_lfc$perturbation) != "NT"])
+variable.genes <- c()
+
+for (i in 1:length(colnames(lambdas))) {
+  pert <- colnames(lambdas)[i]
+  up.lambda <- lambdas %>% dplyr::filter(.data[[pert]] > 0) %>% arrange(desc(.data[[pert]])) %>% head(n=100) %>% rownames
+  down.lambda <- lambdas %>% dplyr::filter(.data[[pert]] < 0) %>% arrange(.data[[pert]]) %>% head(n=100) %>% rownames
+  variable.genes <- union(variable.genes, c(up.lambda, down.lambda))
+}
+
+
+
+beta_guide_4sU_lfc_variable <- beta_guide_4sU_lfc %>% dplyr::filter(gene %in% variable.genes)
+beta_lfc_guide_variable <- beta_guide_4sU_lfc_variable
+
+beta_guide_wide <- beta_lfc_guide_variable %>%
+  select(gene, guide, log2FC_beta_vs_NT) %>%
+  pivot_wider(
+    names_from = guide,
+    values_from = log2FC_beta_vs_NT
+  )
+beta_guide_matrix <- beta_guide_wide %>%
+  tibble::column_to_rownames("gene")
+beta_lfc_guide_matrix_variable <- beta_guide_matrix
+
+save(beta_lfc_guide_variable, beta_lfc_guide_matrix_variable, file = "beta_lfc_filtered_low_counts_and_variable_genes_guide.RData")
+
+```
+### ### pca on lfc betas then heatmap
+#### not variable featuers from fingerprints
+```{r}
+load(file = "filtered_beta_guide_and_lfc_4sU_kd_for_low_counts.RData")
+
+lfc_obj <- CreateSeuratObject(counts=beta_lfc_guide_matrix_filtered,data=beta_lfc_guide_matrix_filtered)
+#lam_obj <- CreateSeuratObject(counts=guide.fingerprints$fingerprints$Lambdas,data=guide.fingerprints$fingerprints$Lambdas)
+lfc_obj <- ScaleData(lfc_obj)
+lfc_obj <- RunPCA(lfc_obj,features=rownames(lfc_obj),npcs=30)
+emb <- lfc_obj@reductions$pca@cell.embeddings
+alpha <- 0.7
+sdev <- lfc_obj@reductions$pca@stdev          # per-PC standard deviation (sqrt of eigenvalue)
+sdev <- sdev[seq_len(ncol(emb))]              # align length to the columns present
+emb_rw <- sweep(emb, 2, sdev^alpha, "/")
+
+
+## ============================================================
+## 2-stage filtering of perturbations:
+##   (1) PCA-embedding neighbor filter: max|r_pca| >= 0.6
+##   (2) Raw-lambda neighbor filter:    max|r_raw| >= 0.2
+## Plot ONE heatmap using PCA-embedding correlations for those
+## passing BOTH filters.
+## ============================================================
+
+## --------------------------
+## Knobs
+## --------------------------
+npcs          <- 30
+min_abs_r_pca <- 0.01   # stage-1 (PCA space)
+min_abs_r_raw <- 0.01  # stage-2 (raw lambdas)
+hclust_method <- "average"
+row_fontsize  <- 0.5
+
+## --------------------------
+## 1) Align genes + build Seurat + PCA (perturbations are "cells")
+##    lambdas: genes x perturbations
+## --------------------------
+#genes_use <- rownames(guide.fingerprints$fingerprints$Lambdas)
+
+#lambdas_mat <- as.matrix(guide.fingerprints$fingerprints$Lambdas[genes_use, , drop = FALSE])
+
+genes_use <- rownames(beta_lfc_guide_matrix_filtered)
+
+lfcs_mat <- as.matrix(beta_lfc_guide_matrix_filtered[genes_use, , drop = FALSE])
+
+Z <- emb_rw  # izzy's weighted embeddings
+
+## --------------------------
+## 2) Stage-1 filter: PCA-embedding neighbors
+## --------------------------
+cor_pca_all <- cor(t(Z), method = "pearson")  # perturbation x perturbation
+diag(cor_pca_all) <- NA_real_
+
+max_abs_pca <- apply(abs(cor_pca_all), 1, max, na.rm = TRUE)
+keep_pca    <- max_abs_pca >= min_abs_r_pca
+
+message(
+  "Stage-1 (PCA) kept ", sum(keep_pca), " / ", length(keep_pca),
+  " with max|r_pca| >= ", min_abs_r_pca
+)
+
+if (sum(keep_pca) < 2) stop("Too few passed PCA neighbor filter. Lower min_abs_r_pca.")
+
+perts_pca <- names(keep_pca)[keep_pca]
+
+## --------------------------
+## 3) Stage-2 filter: RAW lambda neighbors, applied within stage-1 set
+## --------------------------
+lfcs_stage1 <- lfcs_mat[, perts_pca, drop = FALSE]   # genes x perts (stage-1)
+cor_raw_stage1 <- cor(lfcs_stage1, method = "pearson", use = "complete.obs")  # perts x perts
+diag(cor_raw_stage1) <- NA_real_
+
+max_abs_raw <- apply(abs(cor_raw_stage1), 1, max, na.rm = TRUE)
+keep_raw    <- max_abs_raw >= min_abs_r_raw
+
+message(
+  "Stage-2 (RAW) kept ", sum(keep_raw), " / ", length(keep_raw),
+  " (among stage-1) with max|r_raw| >= ", min_abs_r_raw
+)
+
+if (sum(keep_raw) < 2) stop("Too few passed raw-lambda neighbor filter. Lower min_abs_r_raw.")
+
+perts_final <- names(keep_raw)[keep_raw]
+
+## --------------------------
+## 4) Final heatmap: PCA correlations (embedding space) for those passing BOTH
+##    (recompute on the displayed set for clean quantiles/clustering)
+## --------------------------
+Z_final <- Z[perts_final, , drop = FALSE]
+cor_pca_final <- cor(t(Z_final), method = "pearson")
+diag(cor_pca_final) <- 0
+
+hc <- hclust(as.dist(1 - cor_pca_final), method = hclust_method)
+
+q  <- quantile(cor_pca_final, probs = c(0.01, 0.99), na.rm = TRUE)
+lo <- max(-1, q[[1]])
+hi <- min( 1, q[[2]])
+diag(cor_pca_final) <- 1
+
+#################################################
+####### plotly version
+# Reorder matrix according to your clustering
+library(plotly)
+#hc <- readRDS("/brahms/mascioi/RBP_screen/novaseq/260120_novaseq/strong_perturbations_hclust.rds")
+#cor_pca_final <- readRDS("/brahms/mascioi/RBP_screen/novaseq/260120_novaseq/strong_perturbations_cor_pca_final.rds")
+
+ord <- hc$order
+cor_plot <- cor_pca_final[rev(ord), ord]
+q  <- quantile(cor_pca_final, probs = c(0.01, 0.99), na.rm = TRUE)
+lo <- max(-1, q[[1]])
+hi <- min( 1, q[[2]])
+
+pf <- plot_ly(
+  x = colnames(cor_plot),
+  y = rownames(cor_plot),
+  z = cor_plot,
+  type = "heatmap",
+  colorscale = list(
+    c(0, "blue"),
+    c(0.5, "white"),
+    c(1, "red")
+  ),
+  zmin = -1,
+  zmax = 1,
+  zmid = 0,
+  hovertemplate = paste(
+    "Guide X: %{x}<br>",
+    "Guide Y: %{y}<br>",
+    "Pearson r: %{z:.3f}<extra></extra>"
+  )
+) %>%
+  layout(
+    xaxis = list(
+      showticklabels = FALSE
+    ),
+    yaxis = list(
+      tickfont = list(size = 7)  # adjust scaling from ComplexHeatmap
+    ),
+    title = paste0("PCA-embedding correlations of filtered beta LFC (n=", nrow(cor_plot), ")")
+  )
+pf
+```
+#### only variable featuers from fingerprints
+```{r}
+load(file = "beta_lfc_filtered_low_counts_and_variable_genes_guide.RData")
+
+lfc_obj <- CreateSeuratObject(counts=beta_lfc_guide_matrix_variable,data=beta_lfc_guide_matrix_variable)
+#lam_obj <- CreateSeuratObject(counts=guide.fingerprints$fingerprints$Lambdas,data=guide.fingerprints$fingerprints$Lambdas)
+lfc_obj <- ScaleData(lfc_obj)
+lfc_obj <- RunPCA(lfc_obj,features=rownames(lfc_obj),npcs=30)
+emb <- lfc_obj@reductions$pca@cell.embeddings
+alpha <- 0.7
+sdev <- lfc_obj@reductions$pca@stdev          # per-PC standard deviation (sqrt of eigenvalue)
+sdev <- sdev[seq_len(ncol(emb))]              # align length to the columns present
+emb_rw <- sweep(emb, 2, sdev^alpha, "/")
+
+
+## ============================================================
+## 2-stage filtering of perturbations:
+##   (1) PCA-embedding neighbor filter: max|r_pca| >= 0.6
+##   (2) Raw-lambda neighbor filter:    max|r_raw| >= 0.2
+## Plot ONE heatmap using PCA-embedding correlations for those
+## passing BOTH filters.
+## ============================================================
+
+## --------------------------
+## Knobs
+## --------------------------
+npcs          <- 30
+min_abs_r_pca <- 0.01   # stage-1 (PCA space)
+min_abs_r_raw <- 0.01  # stage-2 (raw lambdas)
+hclust_method <- "average"
+row_fontsize  <- 0.5
+
+## --------------------------
+## 1) Align genes + build Seurat + PCA (perturbations are "cells")
+##    lambdas: genes x perturbations
+## --------------------------
+#genes_use <- rownames(guide.fingerprints$fingerprints$Lambdas)
+
+#lambdas_mat <- as.matrix(guide.fingerprints$fingerprints$Lambdas[genes_use, , drop = FALSE])
+
+genes_use <- rownames(beta_lfc_guide_matrix_variable)
+
+lfcs_mat <- as.matrix(beta_lfc_guide_matrix_variable[genes_use, , drop = FALSE])
+
+Z <- emb_rw  # izzy's weighted embeddings
+
+## --------------------------
+## 2) Stage-1 filter: PCA-embedding neighbors
+## --------------------------
+cor_pca_all <- cor(t(Z), method = "pearson")  # perturbation x perturbation
+diag(cor_pca_all) <- NA_real_
+
+max_abs_pca <- apply(abs(cor_pca_all), 1, max, na.rm = TRUE)
+keep_pca    <- max_abs_pca >= min_abs_r_pca
+
+message(
+  "Stage-1 (PCA) kept ", sum(keep_pca), " / ", length(keep_pca),
+  " with max|r_pca| >= ", min_abs_r_pca
+)
+
+if (sum(keep_pca) < 2) stop("Too few passed PCA neighbor filter. Lower min_abs_r_pca.")
+
+perts_pca <- names(keep_pca)[keep_pca]
+
+## --------------------------
+## 3) Stage-2 filter: RAW lambda neighbors, applied within stage-1 set
+## --------------------------
+lfcs_stage1 <- lfcs_mat[, perts_pca, drop = FALSE]   # genes x perts (stage-1)
+cor_raw_stage1 <- cor(lfcs_stage1, method = "pearson", use = "complete.obs")  # perts x perts
+diag(cor_raw_stage1) <- NA_real_
+
+max_abs_raw <- apply(abs(cor_raw_stage1), 1, max, na.rm = TRUE)
+keep_raw    <- max_abs_raw >= min_abs_r_raw
+
+message(
+  "Stage-2 (RAW) kept ", sum(keep_raw), " / ", length(keep_raw),
+  " (among stage-1) with max|r_raw| >= ", min_abs_r_raw
+)
+
+if (sum(keep_raw) < 2) stop("Too few passed raw-lambda neighbor filter. Lower min_abs_r_raw.")
+
+perts_final <- names(keep_raw)[keep_raw]
+
+## --------------------------
+## 4) Final heatmap: PCA correlations (embedding space) for those passing BOTH
+##    (recompute on the displayed set for clean quantiles/clustering)
+## --------------------------
+Z_final <- Z[perts_final, , drop = FALSE]
+cor_pca_final <- cor(t(Z_final), method = "pearson")
+diag(cor_pca_final) <- 0
+
+hc <- hclust(as.dist(1 - cor_pca_final), method = hclust_method)
+
+q  <- quantile(cor_pca_final, probs = c(0.01, 0.99), na.rm = TRUE)
+lo <- max(-1, q[[1]])
+hi <- min( 1, q[[2]])
+diag(cor_pca_final) <- 1
+
+#################################################
+####### plotly version
+# Reorder matrix according to your clustering
+library(plotly)
+#hc <- readRDS("/brahms/mascioi/RBP_screen/novaseq/260120_novaseq/strong_perturbations_hclust.rds")
+#cor_pca_final <- readRDS("/brahms/mascioi/RBP_screen/novaseq/260120_novaseq/strong_perturbations_cor_pca_final.rds")
+
+ord <- hc$order
+cor_plot <- cor_pca_final[rev(ord), ord]
+q  <- quantile(cor_pca_final, probs = c(0.01, 0.99), na.rm = TRUE)
+lo <- max(-1, q[[1]])
+hi <- min( 1, q[[2]])
+
+pv <- plot_ly(
+  x = colnames(cor_plot),
+  y = rownames(cor_plot),
+  z = cor_plot,
+  type = "heatmap",
+  colorscale = list(
+    c(0, "blue"),
+    c(0.5, "white"),
+    c(1, "red")
+  ),
+  zmin = -1,
+  zmax = 1,
+  zmid = 0,
+  hovertemplate = paste(
+    "Guide X: %{x}<br>",
+    "Guide Y: %{y}<br>",
+    "Pearson r: %{z:.3f}<extra></extra>"
+  )
+) %>%
+  layout(
+    xaxis = list(
+      showticklabels = FALSE
+    ),
+    yaxis = list(
+      tickfont = list(size = 7)  # adjust scaling from ComplexHeatmap
+    ),
+    title = paste0("PCA-embedding correlations of variable beta LFC (n=", nrow(cor_plot), ")")
+  )
+pv
+```
+#### at gene level
+```{r}
+####### filter all genes not just those in GI Index
+obj <- readRDS("seurat_objects/260904_assigned_cells_w_nascent_counts_nova_ref.rds")
+
+eps <- 1e-8
+
+kd.4sU <- subset(obj, lmix.model != "NP")
+kd.4sU[["RNA"]]$counts <- as(kd.4sU[["RNA"]]$counts, "dgCMatrix")
+gc()
+### by guide
+Idents(kd.4sU) <- kd.4sU$entropy.gene
+table(kd.4sU$entropy.gene)
+table(kd.4sU$entropy.guide)
+# 2. Pseudobulk (sum) counts per group, separately for each assay
+total_counts_gene <- AggregateExpression(kd.4sU, assays = "RNA", group.by = "entropy.gene",
+                                     slot = "counts", return.seurat = FALSE)$RNA
+
+# convert to base matrices immediately
+total_counts_gene <- as.matrix(total_counts_gene)
+
+load("kinetics_rates_per_perturbation_nova_ref_4sU_kd.RData")
+# beta_pert_4sU_lfc <- as.data.frame(beta_4sU) %>%
+#   rownames_to_column("gene") %>%
+#   pivot_longer(-gene, names_to = "perturbation", values_to = "beta") %>%
+#   group_by(gene) %>%
+#   mutate(nt_beta_mean = mean(beta[perturbation == "NT"], na.rm = TRUE),
+#          log2FC_beta_vs_NT = log2((beta + eps) / (nt_beta_mean + eps))) %>%
+#   ungroup()
+# save(beta_pert_4sU_lfc, file = "pert_betas_4sU_lfc_nova_ref.RData")
+load("pert_betas_4sU_lfc_nova_ref.RData")
+
+colnames(total_counts_gene)
+genes.less.than.20.total.counts <- data.frame(genes = rownames(beta_4sU))
+
+rownames(genes.less.than.20.total.counts) <- genes.less.than.20.total.counts$genes
+
+for (i in 1:length(colnames(total_counts_gene))) {
+  pert <- colnames(total_counts_gene)[i]
+  genes.less.than.20.total.counts[rownames(beta_4sU),pert] <- unname(total_counts_gene[rownames(beta_4sU),pert] < 20)
+}
+
+###### filter beta
+#######
+# set genes with less than 20 total counts per perturbation to NA for beta and beta lfc
+
+for (i in 1:length(colnames(beta_4sU))) {
+  pert <- colnames(beta_4sU)[i]
+  t.index <- genes.less.than.20.total.counts[,pert]
+  beta_4sU[t.index,pert] <- NA
+}
+
+low_count_mat <- as.matrix(
+  genes.less.than.20.total.counts[, setdiff(colnames(genes.less.than.20.total.counts), "genes")]
+)
+
+rownames(low_count_mat) <- genes.less.than.20.total.counts$genes
+
+valid <- beta_pert_4sU_lfc$gene %in% rownames(low_count_mat) &
+  beta_pert_4sU_lfc$perturbation %in% colnames(low_count_mat)
+
+low_count <- rep(FALSE, nrow(beta_pert_4sU_lfc))
+
+low_count[valid] <- low_count_mat[
+  cbind(beta_pert_4sU_lfc$gene[valid], beta_pert_4sU_lfc$perturbation[valid])
+]
+
+beta_pert_4sU_lfc$log2FC_beta_vs_NT[low_count] <- NA
+
+
+beta_pert_filtered <- beta_4sU
+beta_lfc_pert_filtered <- beta_pert_4sU_lfc
+
+beta_pert_wide_filtered <- beta_lfc_pert_filtered %>%
+  select(gene, perturbation, log2FC_beta_vs_NT) %>%
+  pivot_wider(
+    names_from = perturbation,
+    values_from = log2FC_beta_vs_NT
+  )
+beta_lfc_pert_matrix_filtered <- beta_pert_wide_filtered %>%
+  tibble::column_to_rownames("gene")
+
+
+save(beta_pert_filtered,beta_lfc_pert_filtered, beta_lfc_pert_matrix_filtered, file = "filtered_beta_pert_and_lfc_4sU_kd_for_low_counts.RData")
+
+
+
+
+#### subset to top up and down
+lambdas <- readRDS("../../novaseq/260120_novaseq/fingerprints/by.gene/lambdas.matrix.rds")
+lambdas <- as.data.frame(lambdas)
+lambdas <- lambdas %>% dplyr::select(unique(beta_pert_4sU_lfc$perturbation)[unique(beta_pert_4sU_lfc$perturbation) != "NT"])
+variable.genes <- c()
+
+for (i in 1:length(colnames(lambdas))) {
+  pert <- colnames(lambdas)[i]
+  up.lambda <- lambdas %>% dplyr::filter(.data[[pert]] > 0) %>% arrange(desc(.data[[pert]])) %>% head(n=100) %>% rownames
+  down.lambda <- lambdas %>% dplyr::filter(.data[[pert]] < 0) %>% arrange(.data[[pert]]) %>% head(n=100) %>% rownames
+  variable.genes <- union(variable.genes, c(up.lambda, down.lambda))
+}
+
+
+
+beta_pert_4sU_lfc_variable <- beta_pert_4sU_lfc %>% dplyr::filter(gene %in% variable.genes)
+beta_lfc_pert_variable <- beta_pert_4sU_lfc_variable
+
+beta_pert_wide <- beta_lfc_pert_variable %>%
+  select(gene, perturbation, log2FC_beta_vs_NT) %>%
+  pivot_wider(
+    names_from = perturbation,
+    values_from = log2FC_beta_vs_NT
+  )
+beta_pert_matrix <- beta_pert_wide %>%
+  tibble::column_to_rownames("gene")
+beta_lfc_pert_matrix_variable <- beta_pert_matrix
+
+save(beta_lfc_pert_variable, beta_lfc_pert_matrix_variable, file = "beta_lfc_filtered_low_counts_and_variable_genes_pert.RData")
+
+
+```
+
+
+
+
