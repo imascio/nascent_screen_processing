@@ -1,0 +1,37 @@
+[Header],,,,,,
+IEMFileVersion,4,,,,,
+Date,10/23/24,,,,,
+Investigator Name,Isabella,,,,,
+Project Name,RBPscreen,,,,,
+Experiment Name,71APAredo,,,,,
+Workflow,GenerateFASTQ,,,,,
+Application,FASTQ Only,,,,,
+Chemistry,Amplicon,,,,,
+,,,,,,
+[Reads],,,,,,
+18,,,,,,
+54,,,,,,
+,,,,,,
+[Settings],,,,,,
+ReverseComplement,0,,,,,
+,,,,,,
+[Data],,,,,,
+Sample_ID,Sample_Name,I7_Index_ID,index,I5_Index_ID,index2,Operator
+1,rna01,RNAp1A4,TTGGCAAGCC,,,IM
+2,rna02,RNAp1B4,AGTTCTCATG,,,IM
+3,rna03,RNAp1C4,GAACTCGACT,,,IM
+4,rna04,RNAp1D4,GCGCTATGGT,,,IM
+5,rna05,RNAp1E4,ATTCTTAGCT,,,IM
+6,rna06,RNAp1F4,TGATATTGCG,,,IM
+7,rna07,RNAp1G4,TTGCCGTAGG,,,IM
+8,rna08,RNAp1H4,GCGCGTTCAT,,,IM
+9,rna09,RNAp1A5,CAGCTAGCGG,,,IM
+10,rna10,RNAp1B5,AGATTACGTT,,,IM
+11,rna11,RNAp1C5,GACTGGACCA,,,IM
+12,rna12,RNAp1D5,CCGCTAAGAG,,,IM
+13,rna13,RNAp1E5,ATACCTCGAC,,,IM
+14,rna14,RNAp1F5,GGTTATCGAA,,,IM
+15,rna15,RNAp1G5,TTCGAATATT,,,IM
+16,rna16,RNAp1H5,TTCCGTCGAC,,,IM
+17,gdo1,ATACp1A4,AAGCATGAGC,,,IM
+18,gdo2,ATACp1A5,ATATGCCGCG,,,IM
